@@ -1,6 +1,7 @@
 import argparse
 import importlib
 from pathlib import Path
+import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -39,6 +40,30 @@ def load_labels(label_path: Optional[str]) -> Optional[List[str]]:
 
     labels = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     return labels or None
+
+
+def index_to_letters(index: int) -> str:
+    """Convert zero-based class index to alphabetic code: 0->A, 25->Z, 26->AA."""
+    if index < 0:
+        return "UNKNOWN"
+
+    n = index
+    chars = []
+    while True:
+        n, r = divmod(n, 26)
+        chars.append(chr(ord("A") + r))
+        if n == 0:
+            break
+        n -= 1
+    return "".join(reversed(chars))
+
+
+def get_label_for_index(cls_idx: int, labels: Optional[List[str]]) -> str:
+    if labels and 0 <= cls_idx < len(labels):
+        return labels[cls_idx]
+
+    # Fallback label to avoid showing raw numeric class id.
+    return f"BISINDO {index_to_letters(cls_idx)}"
 
 
 def build_model(module_name: str, class_name: str, num_classes: Optional[int]) -> nn.Module:
@@ -381,6 +406,8 @@ def run_camera_app(
     frame_count = 0
     last_values = None
     last_indices = None
+    fps = 0.0
+    last_tick = time.perf_counter()
 
     print("Kamera aktif. Tekan 'q' untuk keluar.")
 
@@ -388,6 +415,12 @@ def run_camera_app(
         ok, frame = cap.read()
         if not ok:
             break
+
+        now = time.perf_counter()
+        dt = max(1e-6, now - last_tick)
+        last_tick = now
+        inst_fps = 1.0 / dt
+        fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
 
         frame_count += 1
 
@@ -404,28 +437,50 @@ def run_camera_app(
             last_values, last_indices = torch.topk(probs, k=k, dim=1)
 
         text_lines = []
+        top_name = "Mendeteksi..."
+        top_conf = 0.0
         if last_values is not None and last_indices is not None:
+            first_idx = int(last_indices[0][0].item())
+            first_score = float(last_values[0][0].item())
+            top_name = get_label_for_index(first_idx, labels)
+            top_conf = first_score
+
             for rank, (score, cls_idx) in enumerate(
                 zip(last_values[0].tolist(), last_indices[0].tolist()), start=1
             ):
-                name = str(cls_idx)
-                if labels and cls_idx < len(labels):
-                    name = labels[cls_idx]
+                name = get_label_for_index(int(cls_idx), labels)
                 text_lines.append(f"{rank}. {name} ({score:.2%})")
 
-        y = 30
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+
+        # Header panel.
+        cv2.rectangle(overlay, (0, 0), (w, 120), (20, 20, 20), -1)
+
+        # Right info panel for top-k predictions.
+        panel_x0 = max(0, w - 360)
+        cv2.rectangle(overlay, (panel_x0, 120), (w, min(h, 120 + 40 * max(1, len(text_lines)) + 20)), (15, 15, 15), -1)
+
+        cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+
+        cv2.putText(frame, "BISINDO Realtime", (20, 35), cv2.FONT_HERSHEY_DUPLEX, 0.9, (0, 220, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, f"Device: {device}", (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"FPS: {fps:.1f}", (20, 87), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (120, 255, 120), 2, cv2.LINE_AA)
+        cv2.putText(frame, "Tekan q untuk keluar", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+
+        cv2.putText(frame, top_name, (20, min(h - 40, 160)), cv2.FONT_HERSHEY_DUPLEX, 1.1, (255, 255, 255), 2, cv2.LINE_AA)
+
+        bar_x, bar_y = 20, min(h - 20, 175)
+        bar_w, bar_h = 300, 16
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (90, 90, 90), 1)
+        fill_w = int(bar_w * max(0.0, min(1.0, top_conf)))
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), (0, 215, 255), -1)
+        cv2.putText(frame, f"Confidence: {top_conf:.2%}", (bar_x + 310, bar_y + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 1, cv2.LINE_AA)
+
+        y = 150
         for line in text_lines:
-            cv2.putText(
-                frame,
-                line,
-                (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
-            y += 30
+            cv2.putText(frame, line, (panel_x0 + 15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (245, 245, 245), 1, cv2.LINE_AA)
+            y += 32
 
         cv2.imshow("BISINDO Realtime", frame)
         if (cv2.waitKey(1) & 0xFF) == ord("q"):
@@ -523,10 +578,8 @@ def main():
     print("Top prediksi:")
 
     for rank, (score, cls_idx) in enumerate(zip(values[0].tolist(), indices[0].tolist()), start=1):
-        name = str(cls_idx)
-        if labels and cls_idx < len(labels):
-            name = labels[cls_idx]
-        print(f"{rank}. class={cls_idx} label={name} prob={score:.4f}")
+        name = get_label_for_index(int(cls_idx), labels)
+        print(f"{rank}. word={name} prob={score:.4f}")
 
 
 if __name__ == "__main__":
